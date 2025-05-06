@@ -1,0 +1,407 @@
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, 
+    QPushButton, QLabel, QHBoxLayout, QTabWidget, QMessageBox, QMenu,
+    QListWidget, QListWidgetItem, QSplitter, QStackedWidget, QFrame
+)
+from PyQt6.QtCore import Qt, QPoint, QSize
+from PyQt6.QtGui import QColor, QIcon, QFont
+import sys
+import os
+from app.database import get_emails_from_db, clear_database, get_total_emails_count, mark_as_spam
+from app.fetch_emails import get_latest_emails
+from app.email_details import EmailDetailsWindow
+from app.send_email import SendEmailWindow
+
+class EmailManagerWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("📩 Quản lý Email")
+        self.setGeometry(100, 100, 900, 600)
+
+        # Layout chính là ngang
+        main_layout = QHBoxLayout()
+        
+        # Tạo menu bên trái (sidebar)
+        self.sidebar = QListWidget()
+        self.sidebar.setMaximumWidth(200)
+        self.sidebar.setMinimumWidth(150)
+        self.sidebar.setStyleSheet("""
+            QListWidget {
+                background-color: #f0f0f0;
+                border-right: 1px solid #cccccc;
+                font-size: 14px;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid #e0e0e0;
+            }
+            QListWidget::item:selected {
+                background-color: #007bff;
+                color: white;
+            }
+        """)
+        
+        # Thêm các mục vào sidebar
+        inbox_item = QListWidgetItem("📥 Hộp thư đến")
+        inbox_item.setData(Qt.ItemDataRole.UserRole, "inbox")
+        self.sidebar.addItem(inbox_item)
+        
+        spam_item = QListWidgetItem("🚫 Thư rác")
+        spam_item.setData(Qt.ItemDataRole.UserRole, "spam")
+        self.sidebar.addItem(spam_item)
+        
+        # Khi click vào một mục trong sidebar
+        self.sidebar.currentItemChanged.connect(self.on_sidebar_item_changed)
+        
+        # Stackedwidget để chứa các trang
+        self.stack = QStackedWidget()
+        
+        # Tạo trang cho hộp thư đến
+        self.inbox_page = QWidget()
+        self.setup_inbox_page()
+        self.stack.addWidget(self.inbox_page)
+        
+        # Tạo trang cho thư rác
+        self.spam_page = QWidget()
+        self.setup_spam_page()
+        self.stack.addWidget(self.spam_page)
+        
+        # Thêm sidebar và stack vào layout chính
+        main_layout.addWidget(self.sidebar)
+        main_layout.addWidget(self.stack)
+        
+        # Tạo layout dưới cùng cho các nút chức năng
+        bottom_layout = QVBoxLayout()
+        
+        # Nút soạn thư mới
+        self.compose_button = QPushButton("✉️ Soạn thư mới", self)
+        self.compose_button.clicked.connect(self.compose_email)
+        self.compose_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 8px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        bottom_layout.addWidget(self.compose_button)
+
+        # Nút đăng xuất
+        self.logout_button = QPushButton("🔓 Đăng xuất", self)
+        self.logout_button.clicked.connect(self.logout)
+        self.logout_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 8px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+            }
+        """)
+        bottom_layout.addWidget(self.logout_button)
+        
+        # Layout chính bao gồm layout ngang và layout dưới cùng
+        layout = QVBoxLayout()
+        layout.addLayout(main_layout, 1)  # stretch=1
+        layout.addLayout(bottom_layout)
+        
+        self.setLayout(layout)
+        
+        # Kết nối menu context cho cả hai bảng
+        self.normal_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.normal_table.customContextMenuRequested.connect(self.show_normal_email_context_menu)
+        
+        self.spam_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.spam_table.customContextMenuRequested.connect(self.show_spam_email_context_menu)
+        
+        # Mặc định chọn Hộp thư đến
+        self.sidebar.setCurrentRow(0)
+        self.load_emails(is_spam=False)
+
+    def setup_inbox_page(self):
+        layout = QVBoxLayout()
+        
+        # Tiêu đề trang
+        title_label = QLabel("📥 Hộp thư đến")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # Bảng danh sách email
+        self.normal_table = QTableWidget()
+        self.normal_table.setColumnCount(4)
+        self.normal_table.setHorizontalHeaderLabels(["Người gửi", "Tiêu đề", "Xem nhanh", "Điểm AI"])
+        self.normal_table.horizontalHeader().setStyleSheet("font-weight: bold;")
+        self.normal_table.setStyleSheet("QTableView::item {padding: 5px;}")
+        self.normal_table.cellClicked.connect(lambda row, col: self.open_email_details(row, col, is_spam=False))
+        layout.addWidget(self.normal_table)
+
+        # Thanh phân trang
+        self.normal_page = 1
+        pagination_layout = QHBoxLayout()
+        
+        self.normal_page_label = QLabel(f"Trang {self.normal_page}")
+        self.normal_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.normal_prev_button = QPushButton("⬅ Trang trước")
+        self.normal_prev_button.clicked.connect(lambda: self.prev_page(is_spam=False))
+        
+        self.normal_next_button = QPushButton("Trang sau ➡")
+        self.normal_next_button.clicked.connect(lambda: self.next_page(is_spam=False))
+        
+        self.normal_refresh_button = QPushButton("🔄 Refresh")
+        self.normal_refresh_button.clicked.connect(lambda: self.refresh_emails(is_spam=False))
+        self.normal_refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #0b7dda;
+            }
+        """)
+
+        pagination_layout.addWidget(self.normal_prev_button)
+        pagination_layout.addWidget(self.normal_page_label)
+        pagination_layout.addWidget(self.normal_next_button)
+        pagination_layout.addWidget(self.normal_refresh_button)
+
+        layout.addLayout(pagination_layout)
+        self.inbox_page.setLayout(layout)
+        
+    def setup_spam_page(self):
+        layout = QVBoxLayout()
+        
+        # Tiêu đề trang
+        title_label = QLabel("🚫 Thư rác")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #d32f2f; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # Bảng danh sách email spam
+        self.spam_table = QTableWidget()
+        self.spam_table.setColumnCount(4)
+        self.spam_table.setHorizontalHeaderLabels(["Người gửi", "Tiêu đề", "Xem nhanh", "Điểm AI"])
+        self.spam_table.horizontalHeader().setStyleSheet("font-weight: bold;")
+        self.spam_table.setStyleSheet("QTableView::item {padding: 5px;}")
+        self.spam_table.cellClicked.connect(lambda row, col: self.open_email_details(row, col, is_spam=True))
+        layout.addWidget(self.spam_table)
+
+        # Thanh phân trang
+        self.spam_page_num = 1
+        pagination_layout = QHBoxLayout()
+        
+        self.spam_page_label = QLabel(f"Trang {self.spam_page_num}")
+        self.spam_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.spam_prev_button = QPushButton("⬅ Trang trước")
+        self.spam_prev_button.clicked.connect(lambda: self.prev_page(is_spam=True))
+        
+        self.spam_next_button = QPushButton("Trang sau ➡")
+        self.spam_next_button.clicked.connect(lambda: self.next_page(is_spam=True))
+        
+        self.spam_refresh_button = QPushButton("🔄 Refresh")
+        self.spam_refresh_button.clicked.connect(lambda: self.refresh_emails(is_spam=True))
+        self.spam_refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #0b7dda;
+            }
+        """)
+
+        pagination_layout.addWidget(self.spam_prev_button)
+        pagination_layout.addWidget(self.spam_page_label)
+        pagination_layout.addWidget(self.spam_next_button)
+        pagination_layout.addWidget(self.spam_refresh_button)
+
+        layout.addLayout(pagination_layout)
+        self.spam_page.setLayout(layout)
+
+    def on_sidebar_item_changed(self, current, previous):
+        if current:
+            item_type = current.data(Qt.ItemDataRole.UserRole)
+            if item_type == "inbox":
+                self.stack.setCurrentIndex(0)
+                self.load_emails(is_spam=False)
+            elif item_type == "spam":
+                self.stack.setCurrentIndex(1)
+                self.load_emails(is_spam=True)
+
+    def show_normal_email_context_menu(self, position):
+        if not self.normal_table.rowCount():
+            return
+            
+        # Lấy hàng đã chọn
+        row = self.normal_table.indexAt(position).row()
+        if row < 0:
+            return
+            
+        # Tạo menu
+        menu = QMenu(self)
+        mark_spam_action = menu.addAction("🚫 Đánh dấu là thư rác")
+        
+        # Hiển thị menu và xử lý hành động
+        action = menu.exec(self.normal_table.viewport().mapToGlobal(position))
+        
+        if action == mark_spam_action:
+            email_id = self.current_normal_emails[row]["id"]
+            mark_as_spam(email_id, is_spam=1)
+            self.load_emails(is_spam=False)  # Tải lại danh sách email thường
+
+    def show_spam_email_context_menu(self, position):
+        if not self.spam_table.rowCount():
+            return
+            
+        # Lấy hàng đã chọn
+        row = self.spam_table.indexAt(position).row()
+        if row < 0:
+            return
+            
+        # Tạo menu
+        menu = QMenu(self)
+        not_spam_action = menu.addAction("✅ Không phải thư rác")
+        
+        # Hiển thị menu và xử lý hành động
+        action = menu.exec(self.spam_table.viewport().mapToGlobal(position))
+        
+        if action == not_spam_action:
+            email_id = self.current_spam_emails[row]["id"]
+            mark_as_spam(email_id, is_spam=0)
+            self.load_emails(is_spam=True)  # Tải lại danh sách email spam
+
+    def load_emails(self, is_spam=False):
+        """ Hiển thị email theo trang và loại (spam/normal) """
+        if is_spam:
+            # Load email spam
+            self.current_spam_emails = get_emails_from_db(self.spam_page_num, show_spam=True)
+            self.spam_table.setRowCount(len(self.current_spam_emails))
+            
+            for row, email in enumerate(self.current_spam_emails):
+                self.spam_table.setItem(row, 0, QTableWidgetItem(email["sender"]))
+                self.spam_table.setItem(row, 1, QTableWidgetItem(email["subject"]))
+                
+                snippet = email["snippet"][:50] + "..." if len(email["snippet"]) > 50 else email["snippet"]
+                self.spam_table.setItem(row, 2, QTableWidgetItem(snippet))
+                
+                # Hiển thị phần trăm spam
+                spam_percent = int(email["spam_score"] * 100)
+                spam_item = QTableWidgetItem(f"-{spam_percent}%")
+                spam_item.setForeground(QColor(255, 0, 0))  # Màu đỏ
+                self.spam_table.setItem(row, 3, spam_item)
+            
+            self.spam_page_label.setText(f"Trang {self.spam_page_num}")
+            self.spam_table.resizeColumnsToContents()
+        else:
+            # Load email thường
+            self.current_normal_emails = get_emails_from_db(self.normal_page, show_spam=False)
+            self.normal_table.setRowCount(len(self.current_normal_emails))
+            
+            for row, email in enumerate(self.current_normal_emails):
+                self.normal_table.setItem(row, 0, QTableWidgetItem(email["sender"]))
+                self.normal_table.setItem(row, 1, QTableWidgetItem(email["subject"]))
+                
+                snippet = email["snippet"][:50] + "..." if len(email["snippet"]) > 50 else email["snippet"]
+                self.normal_table.setItem(row, 2, QTableWidgetItem(snippet))
+                
+                # Hiển thị phần trăm spam
+                spam_percent = int(email["spam_score"] * 100)
+                spam_item = QTableWidgetItem(f"-{spam_percent}%")
+                
+                # Đổi màu theo mức độ spam
+                if spam_percent > 50:
+                    spam_item.setForeground(QColor(255, 165, 0))  # Màu cam
+                else:
+                    spam_item.setForeground(QColor(0, 128, 0))  # Màu xanh lá
+                    
+                self.normal_table.setItem(row, 3, spam_item)
+            
+            self.normal_page_label.setText(f"Trang {self.normal_page}")
+            self.normal_table.resizeColumnsToContents()
+
+    def open_email_details(self, row, column, is_spam=False):
+        """ Mở màn hình xem chi tiết email khi người dùng nhấp vào """
+        if is_spam:
+            if not self.current_spam_emails or row >= len(self.current_spam_emails):
+                return
+            email_id = self.current_spam_emails[row]["id"]
+        else:
+            if not self.current_normal_emails or row >= len(self.current_normal_emails):
+                return
+            email_id = self.current_normal_emails[row]["id"]
+            
+        self.email_details_window = EmailDetailsWindow(email_id)
+        self.email_details_window.show()
+
+    def compose_email(self):
+        """ Mở màn hình soạn thư mới """
+        self.send_email_window = SendEmailWindow()
+        self.send_email_window.show()
+    
+    def prev_page(self, is_spam=False):
+        if is_spam:
+            if self.spam_page_num > 1:
+                self.spam_page_num -= 1
+                self.load_emails(is_spam=True)
+        else:
+            if self.normal_page > 1:
+                self.normal_page -= 1
+                self.load_emails(is_spam=False)
+
+    def next_page(self, is_spam=False):
+        """Chuyển sang trang tiếp theo, lấy thêm email nếu cần"""
+        if is_spam:
+            total_emails = get_total_emails_count(show_spam=True)
+            if self.spam_page_num * 20 < total_emails:
+                self.spam_page_num += 1
+                self.load_emails(is_spam=True)
+        else:
+            total_emails = get_total_emails_count(show_spam=False)
+            if self.normal_page * 20 >= total_emails:
+                print("Lấy thêm email từ Gmail API...")
+                get_latest_emails(50)  # Lấy thêm 50 email mới nhất
+            
+            self.normal_page += 1
+            self.load_emails(is_spam=False)
+
+    def refresh_emails(self, is_spam=False):
+        get_latest_emails()  # Lấy email mới
+        if is_spam:
+            self.load_emails(is_spam=True)  # Cập nhật giao diện spam
+        else:
+            self.load_emails(is_spam=False)  # Cập nhật giao diện thường
+
+    def logout(self):
+        """ Đăng xuất, xóa database và token.json """
+        from app.login_window import LoginWindow  # Import LoginWindow để quay lại màn hình đăng nhập
+
+        # Xóa database
+        clear_database()
+        
+        # Xóa token.json (nếu có)
+        if os.path.exists("token.json"):
+            os.remove("token.json")
+
+        print("Đã xóa dữ liệu và token, quay lại màn hình đăng nhập.")
+        
+        # Đóng cửa sổ hiện tại và quay lại màn hình đăng nhập
+        self.close()
+        self.login_window = LoginWindow()
+        self.login_window.show()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = EmailManagerWindow()
+    window.show()
+    sys.exit(app.exec())
